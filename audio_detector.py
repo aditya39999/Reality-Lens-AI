@@ -1,5 +1,9 @@
 import io
 import wave
+import shutil
+import subprocess
+import tempfile
+import os
 import numpy as np
 
 def _ramp_score(value: float, synthetic_at: float, natural_at: float) -> float:
@@ -8,20 +12,66 @@ def _ramp_score(value: float, synthetic_at: float, natural_at: float) -> float:
     frac = (value - natural_at) / (synthetic_at - natural_at)
     return float(max(0.0, min(1.0, frac)))
 
-def _read_wav(audio_bytes: bytes):
+def _read_wav_bytes(audio_bytes: bytes):
+    """Parse standard PCM WAV bytes (8/16/24/32-bit) into a mono float32 array."""
     with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
         n_channels = wf.getnchannels()
         sample_width = wf.getsampwidth()
         framerate = wf.getframerate()
         n_frames = wf.getnframes()
         raw = wf.readframes(n_frames)
-    dtype = {1: np.int8, 2: np.int16, 4: np.int32}.get(sample_width, np.int16)
-    audio = np.frombuffer(raw, dtype=dtype).astype(np.float32)
+    if sample_width == 3:
+        # 24-bit PCM has no native numpy dtype - unpack 3-byte little-endian
+        # samples into int32 by hand instead of silently misreading them as int16.
+        n_samples = len(raw) // 3
+        buf = np.frombuffer(raw, dtype=np.uint8)[:n_samples * 3].reshape(-1, 3)
+        padded = np.zeros((n_samples, 4), dtype=np.uint8)
+        padded[:, :3] = buf
+        audio = padded.view('<i4').astype(np.float32).flatten() / 256.0
+        max_val = float(2 ** 23 - 1)
+    else:
+        dtype = {1: np.uint8, 2: np.int16, 4: np.int32}.get(sample_width)
+        if dtype is None:
+            raise ValueError(f'Unsupported WAV sample width: {sample_width * 8}-bit.')
+        audio = np.frombuffer(raw, dtype=dtype).astype(np.float32)
+        if sample_width == 1:
+            audio -= 128.0  # 8-bit WAV is unsigned; center it like the others
+        max_val = float(np.iinfo(dtype).max)
     if n_channels > 1:
         audio = audio.reshape(-1, n_channels).mean(axis=1)
-    max_val = float(np.iinfo(dtype).max)
     audio = audio / max_val
     return (audio, framerate)
+
+def _convert_to_wav_via_ffmpeg(audio_bytes: bytes, suffix: str) -> bytes:
+    """Best-effort conversion of any ffmpeg-readable audio (mp3, m4a, ogg/opus,
+    aac, flac, ...) to 16-bit mono PCM WAV, so users don't have to pre-convert
+    voice notes by hand."""
+    ffmpeg_path = shutil.which('ffmpeg')
+    if not ffmpeg_path:
+        raise RuntimeError("ffmpeg isn't installed on this machine, so only native .wav files can be read directly. Install ffmpeg, or convert manually first (e.g. `ffmpeg -i input.mp3 output.wav`).")
+    with tempfile.NamedTemporaryFile(suffix=suffix or '.audio', delete=False) as src:
+        src.write(audio_bytes)
+        src_path = src.name
+    dst_path = src_path + '.converted.wav'
+    try:
+        result = subprocess.run([ffmpeg_path, '-y', '-i', src_path, '-ac', '1', '-ar', '16000', '-sample_fmt', 's16', dst_path], capture_output=True, timeout=60)
+        if result.returncode != 0 or not os.path.exists(dst_path):
+            stderr_tail = result.stderr.decode('utf-8', errors='ignore')[-300:]
+            raise RuntimeError(f"ffmpeg couldn't convert this file - it may not be a supported audio format ({stderr_tail.strip() or 'unknown error'}).")
+        with open(dst_path, 'rb') as f:
+            return f.read()
+    finally:
+        for p in (src_path, dst_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+def _read_wav(audio_bytes: bytes, filename: str=''):
+    try:
+        return _read_wav_bytes(audio_bytes)
+    except Exception as native_err:
+        suffix = os.path.splitext(filename)[1] if filename else ''
+        converted = _convert_to_wav_via_ffmpeg(audio_bytes, suffix)
+        return _read_wav_bytes(converted)
 
 def _estimate_pitch_track(audio: np.ndarray, sr: int, frame_ms: int=40):
     frame_len = int(sr * frame_ms / 1000)
@@ -46,11 +96,11 @@ def _estimate_pitch_track(audio: np.ndarray, sr: int, frame_ms: int=40):
             pitches.append(sr / peak_lag)
     return np.array(pitches)
 
-def analyze_audio(audio_bytes: bytes) -> dict:
+def analyze_audio(audio_bytes: bytes, filename: str='') -> dict:
     try:
-        audio, sr = _read_wav(audio_bytes)
+        audio, sr = _read_wav(audio_bytes, filename=filename)
     except Exception as e:
-        return {'ok': False, 'error': f"Couldn't read this file as WAV ({e}). Convert to .wav first (e.g. `ffmpeg -i input.mp3 output.wav`) and try again."}
+        return {'ok': False, 'error': f"Couldn't read this audio file ({e})."}
     if len(audio) < sr * 0.5:
         return {'ok': False, 'error': 'Audio is too short to analyze (need at least ~0.5s).'}
     duration_s = len(audio) / sr
