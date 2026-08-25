@@ -63,7 +63,7 @@ def _frame_ai_score(frame: Image.Image, api_user: str, api_secret: str) -> dict:
     gy, gx = np.gradient(arr)
     grad_mag = np.sqrt(gx ** 2 + gy ** 2)
     grad_std = float(grad_mag.std())
-    heuristic_score = _ramp_score(grad_std, synthetic_at=9.5, natural_at=6.0)
+    heuristic_score = _ramp_score(grad_std, synthetic_at=6.0, natural_at=9.5)
     return {'score': heuristic_score, 'via_api': False, 'error': api_error}
 
 def _face_consistency_score(frames):
