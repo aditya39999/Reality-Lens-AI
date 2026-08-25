@@ -58,12 +58,25 @@ def _frame_ai_score(frame: Image.Image, api_user: str, api_secret: str) -> dict:
         api_error = result.get('error', 'Unknown API error.')
     else:
         api_error = None
+    # NOTE: this fallback only ever measures local gradient/sharpness, which is
+    # driven far more by resolution and compression history than by whether
+    # content is AI-generated. It is NOT a reliable AI-detection signal on its
+    # own, and empirically runs backwards on real-world footage (compressed
+    # real video reads as "low sharpness" -> falsely high AI score; crisp,
+    # well-rendered AI video reads as "high sharpness" -> falsely low AI
+    # score). We keep it only as a very weak, heavily-dampened tiebreaker
+    # pinned near neutral (0.5), rather than letting it swing 0-1 and drive
+    # the verdict when the real detector (Sightengine) isn't available.
     gray = frame.convert('L')
     arr = np.asarray(gray).astype(np.float32)
     gy, gx = np.gradient(arr)
     grad_mag = np.sqrt(gx ** 2 + gy ** 2)
     grad_std = float(grad_mag.std())
-    heuristic_score = _ramp_score(grad_std, synthetic_at=6.0, natural_at=9.5)
+    raw_ramp = _ramp_score(grad_std, synthetic_at=6.0, natural_at=9.5)
+    # Dampen toward 0.5 (neutral / "unknown") instead of letting it claim
+    # near-0 ("definitely real") or near-1 ("definitely AI") confidence.
+    dampening = 0.15
+    heuristic_score = 0.5 + (raw_ramp - 0.5) * dampening
     return {'score': heuristic_score, 'via_api': False, 'error': api_error}
 
 def _locate_haarcascade_dir() -> str:
@@ -170,7 +183,11 @@ def analyze_video(video_bytes: bytes, api_user: str='', api_secret: str='', max_
         ai_texture = {'label': 'AI/Synthetic Texture Detected' if avg_ai_score > 0.5 else 'No AI/Synthetic Texture Detected', 'flagged': avg_ai_score > 0.5, 'score': avg_ai_score, 'detail': f'Averaged across {len(frames)} sampled frames using {method_note}: {avg_ai_score * 100:.1f}% likelihood of AI-generated/synthetic content.' + (' Note: without a working API result, this estimate leans partly on frame sharpness/detail level, which is also affected by resolution and how many times a clip has been re-compressed/re-shared - not AI-ness alone. Weighted accordingly, not treated as conclusive on its own.' if source == 'offline_heuristic' else ''), 'source': source, 'api_success_frac': api_success_frac}
         facial_consistency = {'label': 'Facial Inconsistencies' if face_score > 0.55 else 'Facial Detection Consistent', 'flagged': face_score > 0.55, 'score': face_score, 'detail': face_detail}
         compression_consistency = {'label': 'Frame Compression Inconsistencies' if comp_score > 0.5 else 'Frame Compression Consistent', 'flagged': comp_score > 0.5, 'score': comp_score, 'detail': comp_detail}
-        ai_weight = 0.65 + (1.0 - 0.65) * api_success_frac
+        # Base weight is low (0.15) when no frames used the real API, so the
+        # dampened offline heuristic can't dominate the verdict on its own.
+        # Weight scales up toward 0.65 only as more frames actually get a
+        # real Sightengine result.
+        ai_weight = 0.15 + (0.65 - 0.15) * api_success_frac
         face_eff = face_score if face_score > 0.5 else 0.0
         comp_eff = comp_score if comp_score > 0.45 else 0.0
         weights = {'ai_texture': ai_weight, 'facial_consistency': 0.15, 'compression_consistency': 0.12}
